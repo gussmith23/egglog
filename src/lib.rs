@@ -831,8 +831,11 @@ impl EGraph {
             .backend
             .run_rules(&rule_ids)
             .map_err(|e| Error::BackendError(e.to_string()))?;
+        let semantic_updated = self.semantic_rebuild_all()?;
 
-        Ok(RunReport::singleton(ruleset, iteration_report))
+        let mut report = RunReport::singleton(ruleset, iteration_report);
+        report.updated |= semantic_updated;
+        Ok(report)
     }
 
     fn add_rule(&mut self, rule: ast::ResolvedRule) -> Result<String, Error> {
@@ -1676,10 +1679,27 @@ impl EGraph {
             let store = self.semantic_stores.get(eq_sort_name).ok_or_else(|| {
                 Error::SemanticError(format!("no semantic store for {eq_sort_name}"))
             })?;
-            let sem_l = store.class_sem(&lhs).unwrap_or(lhs);
-            let sem_r = store.class_sem(&rhs).unwrap_or(rhs);
+            let sem_l = store.class_sem(&lhs).ok_or_else(|| {
+                Error::SemanticError(format!(
+                    "missing semantic id for class {:?} in sort {eq_sort_name}",
+                    lhs
+                ))
+            })?;
+            let sem_r = store.class_sem(&rhs).ok_or_else(|| {
+                Error::SemanticError(format!(
+                    "missing semantic id for class {:?} in sort {eq_sort_name}",
+                    rhs
+                ))
+            })?;
             (sem_l, sem_r)
         };
+
+        if sem_l != sem_r {
+            return Err(Error::SemanticError(format!(
+                "semantic ids differ for merge in {eq_sort_name}: {:?} vs {:?}. TODO: support domain-specific conflict resolution.",
+                sem_l, sem_r
+            )));
+        }
 
         // Union in the backend UF.
         let union_action = egglog_bridge::UnionAction::new(&self.backend);
@@ -1748,6 +1768,256 @@ impl EGraph {
         let _ = self.semantic_recompute_upward(eq_sort_name, rep)?;
 
         Ok(rep)
+    }
+
+    /// Recompute semantic bindings for all semantic-enabled eq sorts from the current backend
+    /// tables, invoking merges as needed. Returns whether any semantic bindings or merges
+    /// were applied.
+    fn semantic_rebuild_all(&mut self) -> Result<bool, Error> {
+        // Collect functions whose outputs are semantic-enabled eq sorts.
+        let semantic_functions: Vec<_> = self
+            .functions
+            .iter()
+            .filter_map(|(_, func)| {
+                func.schema
+                    .output
+                    .clone()
+                    .as_arc_any()
+                    .downcast::<EqSort>()
+                    .ok()
+                    .and_then(|eq| {
+                        self.semantic_sorts
+                            .get(&eq.name)
+                            .cloned()
+                            .map(|cfg| (func.clone(), cfg))
+                    })
+            })
+            .collect();
+
+        let mut updated = false;
+
+        for (func, cfg) in semantic_functions {
+            let schema = func.schema.clone();
+            let output_idx = schema.input.len();
+            let eq_sort_name = cfg.eq_sort.name.clone();
+            let sem_fn = self
+                .semantic_stores
+                .get(&eq_sort_name)
+                .and_then(|s| s.sem_function());
+
+            // Snapshot rows to process outside the backend borrow.
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            self.backend.for_each(func.backend_id, |row| {
+                rows.push(row.vals.as_ref().to_vec());
+            });
+
+            // Retry rows whose children are not yet semantically bound until no progress is made.
+            let mut pending = rows;
+            while !pending.is_empty() {
+                let mut next_round = Vec::new();
+                let mut made_progress = false;
+                for vals in pending.into_iter() {
+                    // Canonicalize args/output.
+                    let mut canon_args = Vec::with_capacity(schema.input.len());
+                    for (arg, sort) in vals[..output_idx].iter().zip(schema.input.iter()) {
+                        canon_args.push(self.canon_value(sort, *arg));
+                    }
+                    let out_class = self.canon_value(&schema.output, vals[output_idx]);
+
+                    // Gather child semantics; defer if missing.
+                    let mut child_semantics = Vec::with_capacity(schema.input.len());
+                    let mut missing_child = false;
+                    for (arg, sort) in canon_args.iter().zip(schema.input.iter()) {
+                        let sem = if sort.is_eq_sort() {
+                            if let Some(store) = self.semantic_stores.get(sort.name()) {
+                                match store.class_sem(arg) {
+                                    Some(s) => s,
+                                    None => {
+                                        missing_child = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                *arg
+                            }
+                        } else {
+                            *arg
+                        };
+                        child_semantics.push((sort.clone(), sem));
+                    }
+
+                    if missing_child {
+                        next_round.push(vals);
+                        continue;
+                    }
+
+                    let resolved_fun = ResolvedFunction {
+                        id: ResolvedFunctionId::Prim(ExternalFunctionId::new_const(0)),
+                        partial_arcsorts: schema.input.clone(),
+                        name: func.name().to_owned(),
+                    };
+                    let (mut sem_id, extra_sem_classes) =
+                        cfg.constructor
+                            .construct(self, &resolved_fun, &child_semantics);
+                    sem_id = self.canon_value(&cfg.sem_sort, sem_id);
+
+                    // Handle extra semantic singleton classes.
+                    for (extra_sem_sort, extra_sem_val_raw) in extra_sem_classes {
+                        if let Some((eq_name, _)) = self
+                            .semantic_sorts
+                            .iter()
+                            .find(|(_, c)| c.sem_sort.name() == extra_sem_sort.name())
+                        {
+                            let sem_val = self.canon_value(&extra_sem_sort, extra_sem_val_raw);
+                            let store = self
+                                .semantic_stores
+                                .get_mut(eq_name)
+                                .expect("store exists for registered semantic sort");
+                            if store.sem_class(&sem_val).is_none() {
+                                let fresh = self.backend.fresh_id();
+                                store
+                                    .bind(fresh, sem_val)
+                                    .map_err(|e| Error::SemanticError(e.to_string()))?;
+                                if let Some(func) = store.sem_function() {
+                                    self.backend.add_values_with_desc(
+                                        "semantic_rebuild_extra",
+                                        [(func, vec![fresh, sem_val])],
+                                    );
+                                }
+                                updated = true;
+                                made_progress = true;
+                            }
+                        }
+                    }
+
+                    // Decide binding/merge for the main output.
+                    let (existing_binding, existing_sem_class) = {
+                        let store = self
+                            .semantic_stores
+                            .get(&eq_sort_name)
+                            .expect("semantic store must exist");
+                        (
+                            store.class_sem(&out_class),
+                            store.sem_class(&sem_id),
+                        )
+                    };
+
+                    match (existing_binding, existing_sem_class) {
+                        (Some(current), _) if current != sem_id => {
+                            return Err(Error::SemanticError(format!(
+                                "semantic id mismatch for class {:?} in sort {}: existing {:?}, computed {:?}. TODO: allow configurable conflict resolution.",
+                                out_class, eq_sort_name, current, sem_id
+                            )));
+                        }
+                        (None, Some(other_class)) => {
+                            let rep_other = self.canon_value(&schema.output, other_class);
+                            let rep_out = self.canon_value(&schema.output, out_class);
+                            if rep_other != rep_out {
+                                let union_action = egglog_bridge::UnionAction::new(&self.backend);
+                                self.backend.with_execution_state(|state| {
+                                    union_action.union(state, rep_out, rep_other)
+                                });
+                                self.backend.flush_updates();
+                            }
+                            let rep = self
+                                .backend
+                                .get_canon_repr(out_class, ColumnTy::Id);
+                            let store = self
+                                .semantic_stores
+                                .get_mut(&eq_sort_name)
+                                .expect("semantic store must exist");
+                            store.unbind_class(rep_other);
+                            store.unbind_sem(sem_id);
+                            store
+                                .bind(rep, sem_id)
+                                .map_err(|e| Error::SemanticError(e.to_string()))?;
+                            if let Some(func) = sem_fn {
+                                self.backend.add_values_with_desc(
+                                    "semantic_rebind_canon",
+                                    [(func, vec![rep, sem_id])],
+                                );
+                            }
+                            updated = true;
+                            made_progress = true;
+                        }
+                        (_, Some(other_class)) => {
+                            let rep_other = self.canon_value(&schema.output, other_class);
+                            let rep_out = self.canon_value(&schema.output, out_class);
+                            if rep_other != rep_out {
+                                updated = true;
+                                made_progress = true;
+                                let _ = self.semantic_merge(&eq_sort_name, rep_out, rep_other)?;
+                            } else if other_class != rep_out {
+                                // Canonical representative changed; rebind to the canonical id.
+                                let store = self
+                                    .semantic_stores
+                                    .get_mut(&eq_sort_name)
+                                    .expect("semantic store must exist");
+                                store.unbind_class(other_class);
+                                store.unbind_sem(sem_id);
+                                store
+                                    .bind(rep_out, sem_id)
+                                    .map_err(|e| Error::SemanticError(e.to_string()))?;
+                                if let Some(func) = sem_fn {
+                                    self.backend.add_values_with_desc(
+                                        "semantic_rebind_canon",
+                                        [(func, vec![rep_out, sem_id])],
+                                    );
+                                }
+                                updated = true;
+                                made_progress = true;
+                            }
+                        }
+                        (Some(_), None) => {
+                            // sem_class missing but class binding present: restore the reverse mapping.
+                            let store = self
+                                .semantic_stores
+                                .get_mut(&eq_sort_name)
+                                .expect("semantic store must exist");
+                            store
+                                .bind(out_class, sem_id)
+                                .map_err(|e| Error::SemanticError(e.to_string()))?;
+                            if let Some(func) = sem_fn {
+                                self.backend.add_values_with_desc(
+                                    "semantic_rebuild_bind",
+                                    [(func, vec![out_class, sem_id])],
+                                );
+                            }
+                            updated = true;
+                            made_progress = true;
+                        }
+                        (None, None) => {
+                            let store = self
+                                .semantic_stores
+                                .get_mut(&eq_sort_name)
+                                .expect("semantic store must exist");
+                            store
+                                .bind(out_class, sem_id)
+                                .map_err(|e| Error::SemanticError(e.to_string()))?;
+                            if let Some(func) = sem_fn {
+                                self.backend.add_values_with_desc(
+                                    "semantic_rebuild_bind",
+                                    [(func, vec![out_class, sem_id])],
+                                );
+                            }
+                            updated = true;
+                            made_progress = true;
+                        }
+                    }
+                }
+
+                if !next_round.is_empty() && !made_progress {
+                    return Err(Error::SemanticError(format!(
+                        "missing semantic ids while rebuilding semantics for sort {}",
+                        eq_sort_name
+                    )));
+                }
+
+                pending = next_round;
+            }
+        }
+
+        Ok(updated)
     }
 
     /// Recompute semantic IDs for all parents of the given class and merge if semantics align.

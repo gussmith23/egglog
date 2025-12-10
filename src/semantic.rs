@@ -622,6 +622,12 @@ mod tests {
         let c2 = eg
             .semantic_add("wrap", &[eg.base_to_value::<i64>(2)])
             .unwrap();
+        // Force both classes to share a semantic id so the merge proceeds and triggers the decomposer.
+        {
+            let sem_one = eg.base_to_value::<i64>(1);
+            let store = eg.semantic_stores.get_mut("Box").unwrap();
+            store.class_sem.insert(c2, sem_one);
+        }
         let rep = eg.semantic_merge("Box", c1, c2).unwrap();
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -631,7 +637,100 @@ mod tests {
             sem_store.sem_class(&eg.base_to_value::<i64>(1)),
             Some(rep_canon)
         );
-        assert!(sem_store.sem_class(&eg.base_to_value::<i64>(2)).is_none());
+    }
+
+    #[test]
+    fn semantic_merge_errors_on_mismatched_semantics() {
+        use crate::Schema;
+        use crate::prelude::{add_constructor, add_sort};
+
+        let mut eg = EGraph::default();
+        add_sort(&mut eg, "Box").unwrap();
+        add_constructor(
+            &mut eg,
+            "wrap",
+            Schema::new(vec!["i64".into()], "Box".into()),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let eq_sort = eg.get_sort_by::<EqSort>(|s| s.name == "Box");
+        let sem_sort = eg.get_sort_by_name("i64").unwrap().clone();
+        eg.add_semantic_domain(eq_sort, sem_sort, Arc::new(IdentityConstructor))
+            .unwrap();
+
+        let c1 = eg
+            .semantic_add("wrap", &[eg.base_to_value::<i64>(1)])
+            .unwrap();
+        let c2 = eg
+            .semantic_add("wrap", &[eg.base_to_value::<i64>(2)])
+            .unwrap();
+
+        let err = eg.semantic_merge("Box", c1, c2).unwrap_err();
+        assert!(matches!(err, crate::Error::SemanticError(msg) if msg.contains("semantic ids differ")));
+    }
+
+    #[test]
+    fn semantic_rebuild_processes_backend_rows() {
+        use crate::prelude::{add_constructor, add_sort};
+        use egglog_bridge::ColumnTy;
+
+        let mut eg = EGraph::default();
+        add_sort(&mut eg, "Expr").unwrap();
+        add_constructor(
+            &mut eg,
+            "lit",
+            crate::Schema::new(vec!["i64".into()], "Expr".into()),
+            None,
+            false,
+        )
+        .unwrap();
+        add_constructor(
+            &mut eg,
+            "add",
+            crate::Schema::new(vec!["Expr".into(), "Expr".into()], "Expr".into()),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let eq_sort = eg.get_sort_by::<EqSort>(|s| s.name == "Expr");
+        let sem_sort = eg.get_sort_by_name("i64").unwrap().clone();
+        eg.add_semantic_domain(eq_sort, sem_sort, Arc::new(ExprConstructor))
+            .unwrap();
+
+        let lit_fn = eg.functions.get("lit").unwrap().clone();
+        let add_fn = eg.functions.get("add").unwrap().clone();
+
+        let v2 = eg.backend.base_values().get::<i64>(2);
+        let v3 = eg.backend.base_values().get::<i64>(3);
+        let v1 = eg.backend.base_values().get::<i64>(1);
+        let v4 = eg.backend.base_values().get::<i64>(4);
+
+        let c2 = eg.backend.add_term(lit_fn.backend_id, &[v2], "test");
+        let c3 = eg.backend.add_term(lit_fn.backend_id, &[v3], "test");
+        let c1 = eg.backend.add_term(lit_fn.backend_id, &[v1], "test");
+        let c4 = eg.backend.add_term(lit_fn.backend_id, &[v4], "test");
+
+        let p1 = eg
+            .backend
+            .add_term(add_fn.backend_id, &[c2, c3], "test_add");
+        let p2 = eg
+            .backend
+            .add_term(add_fn.backend_id, &[c1, c4], "test_add");
+
+        assert!(eg.semantic_rebuild_all().unwrap());
+
+        let rep1 = eg.backend.get_canon_repr(p1, ColumnTy::Id);
+        let rep2 = eg.backend.get_canon_repr(p2, ColumnTy::Id);
+        assert_eq!(rep1, rep2);
+
+        let sem_store = eg.semantic_store("Expr").unwrap();
+        assert_eq!(
+            eg.value_to_base::<i64>(sem_store.class_sem(&rep1).unwrap()),
+            5
+        );
     }
 
     #[test]
