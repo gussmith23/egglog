@@ -19,11 +19,13 @@ mod core;
 pub mod extract;
 pub mod prelude;
 pub mod scheduler;
+mod semantic;
 mod serialize;
 pub mod sort;
 mod termdag;
 mod typechecking;
 pub mod util;
+pub use semantic::*;
 
 // This is used to allow the `add_primitive` macro to work in
 // both this crate and other crates by referring to `::egglog`.
@@ -209,6 +211,9 @@ pub struct EGraph {
     pub fact_directory: Option<PathBuf>,
     pub seminaive: bool,
     type_info: TypeInfo,
+    semantic_sorts: HashMap<String, SemanticSortConfig>,
+    semantic_stores: HashMap<String, SemanticStore>,
+    semantic_functions: HashMap<String, Function>,
     /// The run report unioned over all runs so far.
     overall_run_report: RunReport,
     schedulers: DenseIdMap<SchedulerId, SchedulerRecord>,
@@ -293,8 +298,11 @@ impl Default for EGraph {
             rulesets: Default::default(),
             fact_directory: None,
             seminaive: true,
-            overall_run_report: Default::default(),
+            semantic_sorts: Default::default(),
+            semantic_stores: Default::default(),
+            semantic_functions: Default::default(),
             type_info: Default::default(),
+            overall_run_report: Default::default(),
             schedulers: Default::default(),
             commands: Default::default(),
             strict_mode: false,
@@ -1448,6 +1456,367 @@ impl EGraph {
         self.backend.base_values().get::<T>(x)
     }
 
+    /// Convert an id to its canonical representation, taking into account whether it is an e-class id.
+    fn canon_value(&self, sort: &ArcSort, value: Value) -> Value {
+        self.backend
+            .get_canon_repr(value, sort.column_ty(&self.backend))
+    }
+
+    /// Insert a constructor application for an eq sort that has a registered semantic domain.
+    ///
+    /// This computes the semantic ID for the output, reuses an existing e-class if one
+    /// already has that semantic ID, or creates and binds a new class otherwise.
+    pub fn semantic_add(&mut self, func_name: &str, args: &[Value]) -> Result<Value, Error> {
+        let (schema_input, output_sort, backend_id) = {
+            let function = self.functions.get(func_name).ok_or_else(|| {
+                Error::NotFoundError(NotFoundError(format!("function {func_name}")))
+            })?;
+            (
+                function.schema.input.clone(),
+                function.schema.output.clone(),
+                function.backend_id,
+            )
+        };
+        let eq_sort = output_sort
+            .clone()
+            .as_arc_any()
+            .downcast::<EqSort>()
+            .map_err(|_| {
+                Error::SemanticError(format!("function {func_name} output is not EqSort"))
+            })?;
+        let cfg = self
+            .semantic_sorts
+            .get(&eq_sort.name)
+            .cloned()
+            .ok_or_else(|| {
+                Error::SemanticError(format!("no semantic domain for eq sort {}", eq_sort.name))
+            })?;
+
+        if args.len() != schema_input.len() {
+            return Err(Error::SemanticError(format!(
+                "arity mismatch for {func_name}: expected {}, got {}",
+                schema_input.len(),
+                args.len()
+            )));
+        }
+
+        // Canonicalize args and collect child semantic IDs.
+        let mut canon_args = Vec::with_capacity(args.len());
+        let mut child_semantics = Vec::with_capacity(args.len());
+        for (arg, sort) in args.iter().zip(schema_input.iter()) {
+            let canon = self.canon_value(sort, *arg);
+            canon_args.push(canon);
+            let sem = if sort.is_eq_sort() {
+                if let Some(store) = self.semantic_stores.get(sort.name()) {
+                    store.class_sem(&canon).ok_or_else(|| {
+                        Error::SemanticError(format!(
+                            "missing semantic id for class {:?} of sort {}",
+                            canon,
+                            sort.name()
+                        ))
+                    })?
+                } else {
+                    canon
+                }
+            } else {
+                canon
+            };
+            child_semantics.push((sort.clone(), sem));
+        }
+
+        // Build a light ResolvedFunction for the constructor hook.
+        let resolved_fun = ResolvedFunction {
+            id: ResolvedFunctionId::Prim(ExternalFunctionId::new_const(0)),
+            partial_arcsorts: schema_input.clone(),
+            name: func_name.to_owned(),
+        };
+        let (sem_id, extra_sem_classes) =
+            cfg.constructor
+                .construct(self, &resolved_fun, &child_semantics);
+
+        // Handle structured fallback extra semantic classes (best-effort).
+        for (extra_sem_sort, extra_sem_val) in extra_sem_classes {
+            if let Some((eq_name, _cfg)) = self
+                .semantic_sorts
+                .iter()
+                .find(|(_, c)| c.sem_sort.name() == extra_sem_sort.name())
+            {
+                let store = self.semantic_stores.get_mut(eq_name).unwrap();
+                let fresh = self.backend.fresh_id();
+                let _ = store.bind(fresh, extra_sem_val);
+                if let Some(func) = store.sem_function() {
+                    self.backend.add_values_with_desc(
+                        "semantic_add_extra",
+                        [(func, vec![fresh, extra_sem_val])],
+                    );
+                }
+            }
+        }
+
+        let store = self
+            .semantic_stores
+            .get_mut(&cfg.eq_sort.name)
+            .expect("semantic store should exist");
+
+        if let Some(existing) = store.sem_class(&sem_id) {
+            store
+                .bind(existing, sem_id)
+                .map_err(|e| Error::SemanticError(e.to_string()))?;
+
+            // Ensure the function row exists with the existing class id.
+            let mut row = canon_args.clone();
+            row.push(existing);
+            self.backend
+                .add_values_with_desc("semantic_add", [(backend_id, row)]);
+            if let Some(func) = store.sem_function() {
+                self.backend
+                    .add_values_with_desc("semantic_add_semfn", [(func, vec![existing, sem_id])]);
+            }
+            return Ok(existing);
+        }
+
+        // No existing semantic class; create a new one via the backend, then bind.
+        let new_id = self
+            .backend
+            .add_term(backend_id, &canon_args, "semantic_add");
+        store
+            .bind(new_id, sem_id)
+            .map_err(|e| Error::SemanticError(e.to_string()))?;
+        if let Some(func) = store.sem_function() {
+            self.backend
+                .add_values_with_desc("semantic_add_semfn_new", [(func, vec![new_id, sem_id])]);
+        }
+        Ok(new_id)
+    }
+
+    /// Merge two e-classes of the same semantic-enabled `EqSort`, invoking decomposers.
+    pub fn semantic_merge(
+        &mut self,
+        eq_sort_name: &str,
+        lhs: Value,
+        rhs: Value,
+    ) -> Result<Value, Error> {
+        let cfg = self
+            .semantic_sorts
+            .get(eq_sort_name)
+            .cloned()
+            .ok_or_else(|| {
+                Error::SemanticError(format!("no semantic domain for eq sort {eq_sort_name}"))
+            })?;
+        let eq_sort_arc: ArcSort = cfg.eq_sort.clone();
+
+        // Canonicalize classes before merging.
+        let lhs = self.canon_value(&eq_sort_arc, lhs);
+        let rhs = self.canon_value(&eq_sort_arc, rhs);
+
+        if lhs == rhs {
+            return Ok(lhs);
+        }
+
+        let (sem_l, sem_r) = {
+            let store = self.semantic_stores.get(eq_sort_name).ok_or_else(|| {
+                Error::SemanticError(format!("no semantic store for {eq_sort_name}"))
+            })?;
+            let sem_l = store.class_sem(&lhs).unwrap_or(lhs);
+            let sem_r = store.class_sem(&rhs).unwrap_or(rhs);
+            (sem_l, sem_r)
+        };
+
+        // Union in the backend UF.
+        let union_action = egglog_bridge::UnionAction::new(&self.backend);
+        self.backend
+            .with_execution_state(|state| union_action.union(state, lhs, rhs));
+        self.backend.flush_updates();
+        let rep = self
+            .backend
+            .get_canon_repr(lhs, egglog_bridge::ColumnTy::Id);
+
+        // Update semantic store bindings: prefer the left semantic id.
+        {
+            let store = self
+                .semantic_stores
+                .get_mut(eq_sort_name)
+                .expect("store present");
+            store.unbind_class(lhs);
+            store.unbind_class(rhs);
+            store.unbind_sem(sem_l);
+            store.unbind_sem(sem_r);
+            store
+                .bind(rep, sem_l)
+                .map_err(|e| Error::SemanticError(e.to_string()))?;
+            if let Some(func) = store.sem_function() {
+                self.backend
+                    .add_values_with_desc("semantic_merge", [(func, vec![rep, sem_l])]);
+            }
+        }
+
+        // Run decomposers for this domain.
+        let mut pending: Vec<(ArcSort, Value, Value)> = Vec::new();
+        for entry in cfg.decomposers {
+            if entry.lhs_sem_sort.name() == cfg.sem_sort.name()
+                && entry.rhs_sem_sort.name() == cfg.sem_sort.name()
+            {
+                pending.extend(entry.func.decompose(self, sem_l, sem_r));
+            }
+        }
+
+        let mut merge_queue: Vec<(String, Value, Value)> = Vec::new();
+
+        while let Some((child_sem_sort, child_l, child_r)) = pending.pop() {
+            // Find the eq sort whose semantic domain matches child_sem_sort.
+            if let Some((child_eq_name, _child_cfg)) = self
+                .semantic_sorts
+                .iter()
+                .find(|(_, c)| c.sem_sort.name() == child_sem_sort.name())
+            {
+                // Look up the classes by semantic id; skip if not bound.
+                let store = self
+                    .semantic_stores
+                    .get(child_eq_name)
+                    .expect("store exists for registered semantic sort");
+                if let (Some(cl), Some(cr)) = (store.sem_class(&child_l), store.sem_class(&child_r))
+                {
+                    merge_queue.push((child_eq_name.clone(), cl, cr));
+                }
+            }
+        }
+
+        for (child_eq, cl, cr) in merge_queue {
+            let _ = self.semantic_merge(&child_eq, cl, cr)?;
+        }
+
+        // Upward propagation: merging this class might affect parents.
+        let _ = self.semantic_recompute_upward(eq_sort_name, rep)?;
+
+        Ok(rep)
+    }
+
+    /// Recompute semantic IDs for all parents of the given class and merge if semantics align.
+    fn semantic_recompute_upward(&mut self, eq_sort_name: &str, class: Value) -> Result<(), Error> {
+        // Find functions whose inputs include this eq sort and whose outputs are semantic-enabled eq sorts.
+        let mut work: Vec<(String, ResolvedSchema, egglog_bridge::FunctionId)> = Vec::new();
+        for (name, f) in &self.functions {
+            if f.schema.input.iter().any(|s| s.name() == eq_sort_name) {
+                if let Some(out_eq) = f
+                    .schema
+                    .output
+                    .clone()
+                    .as_arc_any()
+                    .downcast_ref::<EqSort>()
+                {
+                    if self.semantic_sorts.contains_key(&out_eq.name) {
+                        work.push((name.clone(), f.schema.clone(), f.backend_id));
+                    }
+                }
+            }
+        }
+
+        for (fname, schema, backend_id) in work {
+            let mut merge_queue: Vec<(Value, Value, String)> = Vec::new();
+            let mut affected: Vec<(Vec<Value>, Value)> = Vec::new();
+            self.backend.for_each(backend_id, |row| {
+                let mut canon_args = Vec::with_capacity(schema.input.len());
+                for (arg, sort) in row.vals[..schema.input.len()]
+                    .iter()
+                    .zip(schema.input.iter())
+                {
+                    canon_args.push(self.canon_value(sort, *arg));
+                }
+                if !canon_args.iter().any(|v| *v == class) {
+                    return;
+                }
+                let parent_class = row.vals[schema.input.len()];
+                affected.push((canon_args, parent_class));
+            });
+
+            for (canon_args, parent_class_raw) in affected {
+                let parent_class = self.canon_value(&schema.output, parent_class_raw);
+                // Child semantics.
+                let mut child_sem = Vec::with_capacity(schema.input.len());
+                for (arg, sort) in canon_args.iter().zip(schema.input.iter()) {
+                    let sem = if sort.is_eq_sort() {
+                        if let Some(store) = self.semantic_stores.get(sort.name()) {
+                            match store.class_sem(arg) {
+                                Some(s) => s,
+                                None => continue,
+                            }
+                        } else {
+                            *arg
+                        }
+                    } else {
+                        *arg
+                    };
+                    child_sem.push((sort.clone(), sem));
+                }
+
+                let resolved_fun = ResolvedFunction {
+                    id: ResolvedFunctionId::Prim(ExternalFunctionId::new_const(0)),
+                    partial_arcsorts: schema.input.clone(),
+                    name: fname.clone(),
+                };
+                let out_eq_name = schema.output.name();
+                let cfg = match self.semantic_sorts.get(out_eq_name) {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+                let (new_sem, _extra) = cfg.constructor.construct(self, &resolved_fun, &child_sem);
+
+                if let Some(store) = self.semantic_stores.get(out_eq_name) {
+                    match store.class_sem(&parent_class) {
+                        Some(current_sem) => {
+                            if current_sem != new_sem {
+                                if let Some(other) = store.sem_class(&new_sem) {
+                                    let store_mut =
+                                        self.semantic_stores.get_mut(out_eq_name).unwrap();
+                                    store_mut.unbind_class(parent_class);
+                                    store_mut.unbind_sem(current_sem);
+                                    let _ = store_mut.bind(parent_class, new_sem);
+                                    if let Some(func) = store_mut.sem_function() {
+                                        self.backend.add_values_with_desc(
+                                            "semantic_recompute_merge",
+                                            [(func, vec![parent_class, new_sem])],
+                                        );
+                                    }
+                                    merge_queue.push((parent_class, other, out_eq_name.to_owned()));
+                                } else {
+                                    let store = self.semantic_stores.get_mut(out_eq_name).unwrap();
+                                    store.unbind_class(parent_class);
+                                    store.unbind_sem(current_sem);
+                                    let _ = store.bind(parent_class, new_sem);
+                                    if let Some(func) = store.sem_function() {
+                                        self.backend.add_values_with_desc(
+                                            "semantic_recompute_bind",
+                                            [(func, vec![parent_class, new_sem])],
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            let store = self.semantic_stores.get_mut(out_eq_name).unwrap();
+                            if let Some(other) = store.sem_class(&new_sem) {
+                                store.unbind_class(other);
+                                store.unbind_sem(new_sem);
+                            }
+                            let _ = store.bind(parent_class, new_sem);
+                            if let Some(func) = store.sem_function() {
+                                self.backend.add_values_with_desc(
+                                    "semantic_recompute_bind_missing",
+                                    [(func, vec![parent_class, new_sem])],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (a, b, out_eq) in merge_queue {
+                let _ = self.semantic_merge(&out_eq, a, b)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Convert from an egglog value to a reference of a Rust container type.
     ///
     /// Returns `None` if the value cannot be converted to the requested container type.
@@ -1757,6 +2126,8 @@ pub enum Error {
     Shadowing(String, Span, Span),
     #[error("{1}\nCommand already exists: {0}")]
     CommandAlreadyExists(String, Span),
+    #[error("semantic error: {0}")]
+    SemanticError(String),
     #[error("Incorrect format in file '{0}'.")]
     InputFileFormatError(String),
 }
