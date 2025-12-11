@@ -1,0 +1,17 @@
+## 2025-11-29
+- Added semantic scaffolding: new semantic traits/config/store, registration APIs, and bijection enforcement between e-classes and semantic IDs.
+- Extended `EGraph` to track semantic configurations/stores; initial unit tests passing.
+- Added TDD scaffolding for semantic constructors: simple arithmetic constructor tests in `src/semantic.rs`.
+- Implemented `EGraph::semantic_add` to create/merge eq classes based on semantic IDs and added insertion tests ensuring semantic merges happen on equal semantics and stay distinct otherwise.
+- Added semantic merge plumbing with decomposer hooks and counting test; semantic store supports rebind/unbind to maintain bijection during merges.
+- Prototyped upward semantic recomputation and added (ignored) regression test while iterating; semantic merge now triggers recompute and handles missing semantics more defensively.
+- Began DSL exposure: registering a read-only `sem_<EqSort>` function when adding a semantic domain, storing its backend id in `SemanticStore`, and populating it alongside semantic bindings. All tests pass (one recompute test still ignored).
+## 2025-12-10
+- User asked if they can write a conversation log for a Codex conversation; preparing concise guidance.
+## 2025-12-10
+- Wired semantics into normal DSL execution: added `semantic_rebuild_all` to compute/bind semantics for backend-inserted rows, reconcile canonical ids, and trigger semantic merges/decomposers; invoked after rule/action/expression evaluation so schedules see semantic merges.
+- Added strict mismatch policy (semantic merge errors when IDs differ) and tests for both conflict errors and rebuild path; semantic merge tests adjusted accordingly.
+- Hooked semantic recomputation into rule runs to propagate `updated` when semantics change; added new backend-insertion semantic merge test and ensured semantic rebuild handles deferrals.
+## 2025-12-10
+- Investigation: moving semantic logic into `egglog-bridge` is blocked by crate boundaries. Backend has no `ArcSort`/`EqSort`/`ResolvedFunction` or semantic trait types; adding semantics there would require a new shared crate for sorts/semantic traits or making `egglog-bridge` depend on `egglog` (cycle). For now, semantic logic remains in `src/lib.rs`/`src/semantic.rs`; backend remains semantics-agnostic.
+- Idea for future backend integration: treat semantic IDs as backend table data with bijection enforcement. Register per-function constructor/decomposer callbacks (on raw `Value`s) when adding tables; store `(class_id, sem_id)` in a shadow table with a unique index. On add/merge/rebuild, backend uses constructors to compute semantics, merges by semantic ID (error or resolve conflicts), and runs decomposers to enqueue further merges. This would move semantics into the UF/rebuild path without needing front-end type info. For now we keep the simpler front-end implementation despite potential inefficiency.
